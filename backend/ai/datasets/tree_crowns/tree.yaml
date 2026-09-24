@@ -1,0 +1,7 @@
+path: D:/sylasense/backend/ai/datasets/tree_crowns
+
+train: images/train
+val: images/val
+
+names:
+  0: tree

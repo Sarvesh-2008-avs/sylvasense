@@ -1,0 +1,28 @@
+﻿# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Python
+backend/.venv/
+backend/.venv-deepforest/
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets
+.env
+*.env
+credentials/
+
+# Large AI model files
+*.ckpt
+*.pt
+*.pth
+
+# Temporary files
+*.tmp
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
