@@ -92,10 +92,16 @@ class AnalyzeRequest(BaseModel):
 
     max_cloud: float = 20.0
 
-    # Optional forest-density assumptions.
-    # These can later be supplied by the selected forest location.
-    tree_density_per_ha: float = 540.0
-    average_biomass_per_tree_kg: float = 108.0
+    # Optional selected forest-location profile.
+    location_id: Optional[str] = None
+    location_name: Optional[str] = None
+    forest_type: Optional[str] = None
+
+    # Optional tree-density and biomass assumptions.
+    # When omitted, the backend derives a density class from NDVI
+    # and uses 108 kg as the default average biomass per tree.
+    tree_density_per_ha: Optional[float] = None
+    average_biomass_per_tree_kg: Optional[float] = None
 
 
 class ChangeRequest(BaseModel):
@@ -542,6 +548,8 @@ def analyze(request: AnalyzeRequest):
         # This adds real radar information to the main analysis.
         # VV and VH are returned in dB. If no suitable S1 image
         # exists for the AOI/date range, the values remain null.
+                # ----------------------------------------------------
+        # SENTINEL-1 SAR ANALYSIS
         # ----------------------------------------------------
 
         s1_collection = get_sentinel1_collection(
@@ -550,7 +558,11 @@ def analyze(request: AnalyzeRequest):
             request.end_date
         )
 
-        s1_image_count = s1_collection.size().getInfo()
+        s1_image_count = (
+            s1_collection
+            .size()
+            .getInfo()
+        )
 
         s1_vv_mean = None
         s1_vh_mean = None
@@ -585,85 +597,142 @@ def analyze(request: AnalyzeRequest):
             )
 
             if s1_stats:
+
                 if s1_stats.get("VV") is not None:
-                    s1_vv_mean = float(s1_stats["VV"])
+
+                    s1_vv_mean = float(
+                        s1_stats["VV"]
+                    )
 
                 if s1_stats.get("VH") is not None:
-                    s1_vh_mean = float(s1_stats["VH"])
+
+                    s1_vh_mean = float(
+                        s1_stats["VH"]
+                    )
 
                 if (
                     s1_vv_mean is not None
-                    and s1_vh_mean is not None
+                    and
+                    s1_vh_mean is not None
                 ):
+
                     s1_vv_vh_difference = (
-                        s1_vv_mean - s1_vh_mean
+                        s1_vv_mean
+                        - s1_vh_mean
                     )
 
         # ----------------------------------------------------
-        # AI-ESTIMATED TREE COUNT
+        # TREE ESTIMATION
         # ----------------------------------------------------
         #
-        # Sentinel-2 does not reliably resolve individual tree
-        # crowns at 10 m resolution.
+        # Sentinel-2 has 10 m spatial resolution and cannot
+        # reliably resolve individual tree crowns.
         #
-        # Therefore this value is an ESTIMATE based on:
+        # Therefore this is an ESTIMATE based on:
         #
-        #   AOI area ? estimated tree density
+        # AOI area × estimated tree density
         #
-        # The density can later be supplied from the selected
-        # forest-location profile.
+        # This is different from the experimental DeepForest
+        # uploaded-image detector.
         # ----------------------------------------------------
 
         if mean_ndvi >= 0.50:
+
             default_density = 540.0
             density_class = "Dense vegetation"
+
         elif mean_ndvi >= 0.35:
+
             default_density = 350.0
             density_class = "Moderate vegetation"
+
         else:
+
             default_density = 180.0
             density_class = "Low vegetation"
 
-        # Use the supplied density when valid.
-        requested_density = float(
-            request.tree_density_per_ha
-        )
+        # Use selected-location density if supplied.
+        if request.tree_density_per_ha is not None:
+
+            requested_density = float(
+                request.tree_density_per_ha
+            )
+
+        else:
+
+            requested_density = default_density
 
         if requested_density <= 0:
+
             requested_density = default_density
 
         tree_density = requested_density
 
+        # Estimated tree count.
         estimated_tree_count = max(
             0,
             round(
-                area_ha * tree_density
+                area_ha
+                * tree_density
             )
         )
 
-        average_biomass_per_tree_kg = float(
-            request.average_biomass_per_tree_kg
-        )
+        # ----------------------------------------------------
+        # AVERAGE BIOMASS PER TREE
+        # ----------------------------------------------------
 
-        if average_biomass_per_tree_kg <= 0:
+        if request.average_biomass_per_tree_kg is not None:
+
+            average_biomass_per_tree_kg = float(
+                request.average_biomass_per_tree_kg
+            )
+
+        else:
+
             average_biomass_per_tree_kg = 108.0
 
-        # AGB = Tree Count ? Average Biomass per Tree
+        if average_biomass_per_tree_kg <= 0:
+
+            average_biomass_per_tree_kg = 108.0
+
+        # ----------------------------------------------------
+        # ABOVE-GROUND BIOMASS
+        # ----------------------------------------------------
+        #
+        # AGB =
+        # Tree Count × Average Biomass per Tree
+        # ----------------------------------------------------
+
         biomass_kg = (
             estimated_tree_count
             * average_biomass_per_tree_kg
         )
 
-        biomass_tonnes = biomass_kg / 1000.0
+        biomass_tonnes = (
+            biomass_kg / 1000.0
+        )
 
-        # Carbon = AGB ? 0.47
+        # ----------------------------------------------------
+        # STORED CARBON
+        # ----------------------------------------------------
+        #
+        # Carbon = AGB × 0.47
+        # ----------------------------------------------------
+
         stored_carbon_tonnes_c = (
             biomass_tonnes * 0.47
         )
 
+        # ----------------------------------------------------
+        # CARBON DENSITY
+        # ----------------------------------------------------
+
         carbon_density_tonnes_c_per_ha = (
+
             stored_carbon_tonnes_c / area_ha
+
             if area_ha > 0
+
             else 0
         )
 
@@ -735,27 +804,49 @@ def analyze(request: AnalyzeRequest):
 
             "sentinel1": {
 
-                "available": s1_image_count > 0,
+                "available": (
+                    s1_image_count > 0
+                ),
 
-                "images_found": s1_image_count,
+                "images_found": (
+                    s1_image_count
+                ),
 
                 "selected_date": s1_date,
 
                 "mean_vv_db": (
-                    round(s1_vv_mean, 4)
+
+                    round(
+                        s1_vv_mean,
+                        4
+                    )
+
                     if s1_vv_mean is not None
+
                     else None
                 ),
 
                 "mean_vh_db": (
-                    round(s1_vh_mean, 4)
+
+                    round(
+                        s1_vh_mean,
+                        4
+                    )
+
                     if s1_vh_mean is not None
+
                     else None
                 ),
 
                 "vv_minus_vh_db": (
-                    round(s1_vv_vh_difference, 4)
+
+                    round(
+                        s1_vv_vh_difference,
+                        4
+                    )
+
                     if s1_vv_vh_difference is not None
+
                     else None
                 ),
 
@@ -764,6 +855,10 @@ def analyze(request: AnalyzeRequest):
                     "VV/VH screening"
                 )
             },
+
+            # ------------------------------------------------
+            # ESTIMATED TREE INFORMATION
+            # ------------------------------------------------
 
             "tree_detection": {
 
@@ -774,7 +869,7 @@ def analyze(request: AnalyzeRequest):
                 "estimated": True,
 
                 "method": (
-                    "AOI area ? estimated tree density"
+                    "AOI area × estimated tree density"
                 ),
 
                 "density_trees_per_ha": round(
@@ -785,18 +880,32 @@ def analyze(request: AnalyzeRequest):
                 "density_class": density_class,
 
                 "message": (
-                    "AI-estimated tree count based on "
-                    "AOI area and forest vegetation "
-                    "density. This is an estimate, not "
+                    "Estimated from AOI area and "
+                    "vegetation density. This is not "
                     "individual tree-crown detection."
                 )
             },
+
+            # ------------------------------------------------
+            # TREE + BIOMASS + CARBON
+            # ------------------------------------------------
 
             "tree_estimation": {
 
                 "enabled": True,
 
-                "estimated_tree_count": estimated_tree_count,
+                "location": {
+
+                    "id": request.location_id,
+
+                    "name": request.location_name,
+
+                    "forest_type": request.forest_type
+                },
+
+                "estimated_tree_count": (
+                    estimated_tree_count
+                ),
 
                 "tree_density_per_ha": round(
                     tree_density,
@@ -828,18 +937,25 @@ def analyze(request: AnalyzeRequest):
                 "estimated": True,
 
                 "method": (
-                    "AOI area ? estimated tree density; "
-                    "AGB = tree count ? average biomass "
-                    "per tree; carbon = AGB ? 0.47"
+                    "AOI area × estimated tree density; "
+                    "AGB = tree count × average biomass "
+                    "per tree; carbon = AGB × 0.47"
                 )
             },
 
+            # ------------------------------------------------
+            # IMAGERY
+            # ------------------------------------------------
+
             "imagery": {
 
-                "ndvi_thumbnail": ndvi_thumbnail,
+                "ndvi_thumbnail": (
+                    ndvi_thumbnail
+                ),
 
-                "true_color_thumbnail":
+                "true_color_thumbnail": (
                     true_color_thumbnail
+                )
             }
         }
 
@@ -894,14 +1010,20 @@ def change_detection(
         # ====================================================
 
         s2_before_collection = (
+
             ee.ImageCollection(
                 "COPERNICUS/S2_SR_HARMONIZED"
             )
-            .filterBounds(geometry)
+
+            .filterBounds(
+                geometry
+            )
+
             .filterDate(
                 request.before_start,
                 request.before_end
             )
+
             .filter(
                 ee.Filter.lt(
                     "CLOUDY_PIXEL_PERCENTAGE",
@@ -911,6 +1033,7 @@ def change_detection(
         )
 
         before_count = (
+
             s2_before_collection
             .size()
             .getInfo()
@@ -927,6 +1050,7 @@ def change_detection(
             )
 
         s2_before = (
+
             s2_before_collection
             .sort(
                 "CLOUDY_PIXEL_PERCENTAGE"
@@ -939,14 +1063,20 @@ def change_detection(
         # ====================================================
 
         s2_after_collection = (
+
             ee.ImageCollection(
                 "COPERNICUS/S2_SR_HARMONIZED"
             )
-            .filterBounds(geometry)
+
+            .filterBounds(
+                geometry
+            )
+
             .filterDate(
                 request.after_start,
                 request.after_end
             )
+
             .filter(
                 ee.Filter.lt(
                     "CLOUDY_PIXEL_PERCENTAGE",
@@ -956,6 +1086,7 @@ def change_detection(
         )
 
         after_count = (
+
             s2_after_collection
             .size()
             .getInfo()
@@ -972,6 +1103,7 @@ def change_detection(
             )
 
         s2_after = (
+
             s2_after_collection
             .sort(
                 "CLOUDY_PIXEL_PERCENTAGE"
@@ -984,6 +1116,7 @@ def change_detection(
         # ====================================================
 
         ndvi_before = (
+
             s2_before
             .normalizedDifference(
                 ["B8", "B4"]
@@ -996,6 +1129,7 @@ def change_detection(
         # ====================================================
 
         ndvi_after = (
+
             s2_after
             .normalizedDifference(
                 ["B8", "B4"]
@@ -1008,6 +1142,7 @@ def change_detection(
         # ====================================================
 
         ndvi_change = (
+
             ndvi_after
             .subtract(
                 ndvi_before
@@ -1020,6 +1155,7 @@ def change_detection(
         # ====================================================
 
         before_ndvi_result = (
+
             ndvi_before
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
@@ -1037,6 +1173,7 @@ def change_detection(
         # ====================================================
 
         after_ndvi_result = (
+
             ndvi_after
             .reduceRegion(
                 reducer=ee.Reducer.mean(),
@@ -1066,6 +1203,7 @@ def change_detection(
         )
 
         ndvi_difference = (
+
             ndvi_after_value
             - ndvi_before_value
         )
@@ -1102,6 +1240,7 @@ def change_detection(
                     "VV"
                 )
             )
+
             .filter(
                 ee.Filter.listContains(
                     "transmitterReceiverPolarisation",
@@ -1109,10 +1248,13 @@ def change_detection(
                 )
             )
 
-            .select(["VV", "VH"])
+            .select(
+                ["VV", "VH"]
+            )
         )
 
         s1_before_count = (
+
             s1_before_collection
             .size()
             .getInfo()
@@ -1150,6 +1292,7 @@ def change_detection(
                     "VV"
                 )
             )
+
             .filter(
                 ee.Filter.listContains(
                     "transmitterReceiverPolarisation",
@@ -1157,10 +1300,13 @@ def change_detection(
                 )
             )
 
-            .select(["VV", "VH"])
+            .select(
+                ["VV", "VH"]
+            )
         )
 
         s1_after_count = (
+
             s1_after_collection
             .size()
             .getInfo()
@@ -1179,18 +1325,21 @@ def change_detection(
         ):
 
             radar_before = (
+
                 s1_before_collection
                 .median()
                 .select("VV")
             )
 
             radar_after = (
+
                 s1_after_collection
                 .median()
                 .select("VV")
             )
 
             radar_change = (
+
                 radar_after
                 .subtract(
                     radar_before
@@ -1199,6 +1348,7 @@ def change_detection(
             )
 
             radar_result = (
+
                 radar_change
                 .reduceRegion(
                     reducer=ee.Reducer.mean(),
@@ -1264,6 +1414,7 @@ def change_detection(
         }
 
         change_thumbnail = (
+
             ndvi_change
             .getThumbURL(
                 change_params
@@ -1275,6 +1426,7 @@ def change_detection(
         # ====================================================
 
         before_date = (
+
             s2_before
             .date()
             .format("YYYY-MM-dd")
@@ -1282,6 +1434,7 @@ def change_detection(
         )
 
         after_date = (
+
             s2_after
             .date()
             .format("YYYY-MM-dd")
@@ -1331,23 +1484,20 @@ def change_detection(
 
             "sentinel2": {
 
-                "ndvi_before":
-                    round(
-                        ndvi_before_value,
-                        4
-                    ),
+                "ndvi_before": round(
+                    ndvi_before_value,
+                    4
+                ),
 
-                "ndvi_after":
-                    round(
-                        ndvi_after_value,
-                        4
-                    ),
+                "ndvi_after": round(
+                    ndvi_after_value,
+                    4
+                ),
 
-                "ndvi_change":
-                    round(
-                        ndvi_difference,
-                        4
-                    )
+                "ndvi_change": round(
+                    ndvi_difference,
+                    4
+                )
             },
 
             "sentinel1": {
@@ -1358,21 +1508,22 @@ def change_detection(
                 "after_images":
                     s1_after_count,
 
-                "vv_change_db":
-                    (
-                        round(
-                            radar_difference,
-                            4
-                        )
-                        if radar_difference is not None
-                        else None
+                "vv_change_db": (
+
+                    round(
+                        radar_difference,
+                        4
                     )
+
+                    if radar_difference is not None
+
+                    else None
+                )
             },
 
             "change": {
 
-                "status":
-                    status,
+                "status": status,
 
                 "method": (
                     "Sentinel-2 NDVI temporal "
@@ -1410,9 +1561,7 @@ def change_detection(
             status_code=500,
             detail=str(e)
         )
-
-
-# ============================================================
+        # ============================================================
 # AI TREE DETECTION
 # ============================================================
 
@@ -1423,12 +1572,14 @@ TREE_MODEL_PATH = (
     / "trained_tree_model_v2.ckpt"
 )
 
+
 DEEPFOREST_PYTHON = (
     Path(__file__).resolve().parent
     / ".venv-deepforest"
     / "Scripts"
     / "python.exe"
 )
+
 
 TREE_HELPER = (
     Path(__file__).resolve().parent
@@ -1438,8 +1589,13 @@ TREE_HELPER = (
 )
 
 
+# ============================================================
+# TREE DETECTION STATUS
+# ============================================================
+
 @app.get("/api/tree-detection/status")
 def tree_detection_status():
+
     available = (
         TREE_MODEL_PATH.exists()
         and DEEPFOREST_PYTHON.exists()
@@ -1447,22 +1603,42 @@ def tree_detection_status():
     )
 
     return {
+
         "available": available,
-        "status": "ready" if available else "model_missing",
-        "model": "DeepForest V2",
-        "model_file": TREE_MODEL_PATH.name,
-        "message": (
-            "Experimental AI tree detection is ready."
+
+        "status": (
+            "ready"
             if available
-            else "DeepForest V2 files are missing."
+            else "model_missing"
+        ),
+
+        "model": "DeepForest V2",
+
+        "model_file": TREE_MODEL_PATH.name,
+
+        "message": (
+
+            "Experimental AI tree detection is ready."
+
+            if available
+
+            else
+            "DeepForest V2 files are missing."
         ),
     }
 
 
+# ============================================================
+# UPLOADED IMAGE TREE DETECTION
+# ============================================================
+
 @app.post("/api/tree-detection")
-async def tree_detection(image: UploadFile = File(...)):
+async def tree_detection(
+    image: UploadFile = File(...)
+):
 
     allowed = {
+
         "image/jpeg",
         "image/jpg",
         "image/png",
@@ -1471,110 +1647,257 @@ async def tree_detection(image: UploadFile = File(...)):
     }
 
     if image.content_type not in allowed:
+
         raise HTTPException(
+
             status_code=400,
-            detail="Please upload a JPG, PNG, TIFF, or WEBP image.",
+
+            detail=(
+                "Please upload a JPG, PNG, TIFF, "
+                "or WEBP image."
+            )
         )
 
     if not TREE_MODEL_PATH.exists():
+
         raise HTTPException(
+
             status_code=503,
-            detail="DeepForest V2 model is missing.",
+
+            detail=(
+                "DeepForest V2 model is missing."
+            )
+        )
+
+    if not DEEPFOREST_PYTHON.exists():
+
+        raise HTTPException(
+
+            status_code=503,
+
+            detail=(
+                "DeepForest Python environment "
+                "is missing."
+            )
+        )
+
+    if not TREE_HELPER.exists():
+
+        raise HTTPException(
+
+            status_code=503,
+
+            detail=(
+                "Tree detection helper script "
+                "is missing."
+            )
         )
 
     temp_path = None
 
     try:
+
+        # ----------------------------------------------------
+        # READ UPLOADED IMAGE
+        # ----------------------------------------------------
+
         data = await image.read()
 
         if not data:
+
             raise HTTPException(
+
                 status_code=400,
-                detail="Uploaded image is empty.",
+
+                detail=(
+                    "Uploaded image is empty."
+                )
             )
 
-        suffix = Path(image.filename or "forest.jpg").suffix or ".jpg"
+        # ----------------------------------------------------
+        # TEMPORARY IMAGE FILE
+        # ----------------------------------------------------
+
+        suffix = (
+            Path(
+                image.filename or "forest.jpg"
+            ).suffix
+            or ".jpg"
+        )
 
         with tempfile.NamedTemporaryFile(
+
             delete=False,
+
             suffix=suffix
+
         ) as tmp:
+
             tmp.write(data)
+
             temp_path = tmp.name
 
+        # ----------------------------------------------------
+        # RUN DEEPFOREST
+        # ----------------------------------------------------
+
         process = subprocess.run(
+
             [
+
                 str(DEEPFOREST_PYTHON),
+
                 str(TREE_HELPER),
+
                 temp_path,
+
                 str(TREE_MODEL_PATH),
+
             ],
+
             capture_output=True,
+
             text=True,
+
             timeout=180,
         )
 
+        # ----------------------------------------------------
+        # PROCESS ERROR
+        # ----------------------------------------------------
+
         if process.returncode != 0:
+
             raise HTTPException(
+
                 status_code=500,
-                detail="Tree detection process failed: " + process.stderr[-1000:],
+
+                detail=(
+                    "Tree detection process failed: "
+                    + process.stderr[-1000:]
+                )
             )
+
+        # ----------------------------------------------------
+        # READ JSON OUTPUT
+        # ----------------------------------------------------
 
         output = process.stdout.strip()
 
-        # Find the JSON result even if another line appears.
         tree_count = None
 
         for line in output.splitlines():
+
             line = line.strip()
 
-            if line.startswith("{") and line.endswith("}"):
+            if (
+                line.startswith("{")
+                and
+                line.endswith("}")
+            ):
+
                 try:
-                    parsed = json.loads(line)
+
+                    parsed = json.loads(
+                        line
+                    )
 
                     if "tree_count" in parsed:
-                        tree_count = int(parsed["tree_count"])
+
+                        tree_count = int(
+                            parsed["tree_count"]
+                        )
+
                         break
 
                 except Exception:
+
                     pass
 
+        # ----------------------------------------------------
+        # NO RESULT
+        # ----------------------------------------------------
+
         if tree_count is None:
+
             raise HTTPException(
+
                 status_code=500,
-                detail="Tree detector returned no tree count.",
+
+                detail=(
+                    "Tree detector returned "
+                    "no tree count."
+                )
             )
 
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
+
         return {
+
             "success": True,
+
             "model": "DeepForest V2",
-            "model_file": TREE_MODEL_PATH.name,
-            "tree_count": tree_count,
+
+            "model_file":
+                TREE_MODEL_PATH.name,
+
+            "tree_count":
+                tree_count,
+
             "experimental": True,
+
             "message": (
-                "Experimental AI tree detection completed successfully."
+                "Experimental AI tree detection "
+                "completed successfully."
             ),
         }
 
     except HTTPException:
+
         raise
 
     except subprocess.TimeoutExpired:
+
         raise HTTPException(
+
             status_code=504,
-            detail="Tree detection timed out after 180 seconds.",
+
+            detail=(
+                "Tree detection timed out "
+                "after 180 seconds."
+            )
         )
 
     except Exception as exc:
+
         raise HTTPException(
+
             status_code=500,
-            detail=f"Tree detection error: {str(exc)}",
+
+            detail=(
+                f"Tree detection error: {str(exc)}"
+            )
         )
 
     finally:
-        if temp_path:
-            try:
-                Path(temp_path).unlink(missing_ok=True)
-            except Exception:
-                pass
 
+        # ----------------------------------------------------
+        # DELETE TEMPORARY FILE
+        # ----------------------------------------------------
+
+        if temp_path:
+
+            try:
+
+                Path(
+                    temp_path
+                ).unlink(
+                    missing_ok=True
+                )
+
+            except Exception:
+
+                pass
+            
